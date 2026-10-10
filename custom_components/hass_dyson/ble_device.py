@@ -1782,6 +1782,44 @@ class DysonBLEDevice:
                     _ATTR_TYPE_READ, attribute_id.to_bytes(2, byteorder="little")
                 )
 
+    async def set_day(self, end: bool, minutes: int) -> None:
+        """Set when the lamp's day starts or ends, in minutes past local midnight.
+
+        Daylight mode works to this day in place of the real sunrise and
+        sunset, and the lamp acts on a change at once.  The lamp drops the odd
+        write, so the value is read back and written again, up to three times.
+
+        Args:
+            end: ``False`` for the start of the day, ``True`` for its end.
+            minutes: Minutes past local midnight, 0 to 1439.
+
+        Raises:
+            RuntimeError: If the lamp is not connected, or did not take the value.
+        """
+        if not 0 <= minutes < 1440:  # noqa: PLR2004
+            raise ValueError(f"{minutes} is not a time of day in minutes")
+        if not self.is_connected or self._client is None:
+            raise RuntimeError(f"{self.serial_number} is not connected")
+        attribute_id = _ATTR_DAY_END if end else _ATTR_DAY_START
+        field = "day_end_minutes" if end else "day_start_minutes"
+        async with self._lock:
+            for _attempt in range(3):
+                setattr(self.state, field, None)
+                await self._write_attr(
+                    attribute_id, minutes.to_bytes(2, byteorder="little")
+                )
+                await asyncio.sleep(0.3)
+                await self._write_attr_message(
+                    _ATTR_TYPE_READ, attribute_id.to_bytes(2, byteorder="little")
+                )
+                await asyncio.sleep(0.7)
+                if getattr(self.state, field) == minutes:
+                    return
+            await self._read_day()
+            raise RuntimeError(
+                f"{self.serial_number} did not take {minutes} for its day"
+            )
+
     async def set_auto_brightness(self, enabled: bool) -> None:
         """Switch auto brightness: the lamp trims its output to the room's light."""
         await self._set_mode_char("11006", BLE_CHAR_11006_UUID, enabled)
