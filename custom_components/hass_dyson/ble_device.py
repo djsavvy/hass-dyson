@@ -101,6 +101,23 @@ _ATTR_TYPE_WRITE = 0x93  # → lamp: attribute(2) length(2) value
 _ATTR_TYPE_SUBSCRIBE = 0x96  # → lamp: attribute(2) 00
 _ATTR_TYPE_REPORT = 0x97  # ← lamp: attribute(2) length(2) value
 _ATTR_DAYLIGHT_MODE = 0x2013
+# What the lamp needs before it will track daylight: the time, then where it
+# is.  It loses the time with its power and discards coordinates until it has
+# one, acknowledging the write all the same.  The MyDyson app sends all of
+# this on every connection; so does this.
+_ATTR_TYPE_SET_CLOCK = 0x80  # → lamp: unix time, uint32 LE (answered with 0x53)
+_ATTR_LATITUDE = 0x2003  # double LE, degrees
+_ATTR_LONGITUDE = 0x2004  # double LE, degrees
+# float LE, hours.minutes (5.30 is five and a half).  Written as the offset of
+# standard time: the lamp adds an hour itself while its daylight-saving rules
+# (attribute 0x201d, set by the MyDyson app and kept through a power cut) say
+# summer time is in force, and reads back the sum.  Measured on an E5R in
+# October in California: -8 written, -7 read; -7 written, -6 read.
+_ATTR_UTC_OFFSET = 0x2005
+_ATTR_DAY_START = 0x2014  # minutes past local midnight; the lamp's sunrise
+_ATTR_DAY_END = 0x2015  # likewise its sunset
+# The lamp's clock gains several minutes a day, so it is set again this often.
+_CLOCK_RESYNC_SECONDS = 3600.0
 # The app's preset modes.  Writing 01 activates one, and the lamp reports the
 # others going off; writing 00 clears it and the light stays as the preset
 # left it.  ("Synchronised", the app's fourth, is daylight mode.)
@@ -462,6 +479,19 @@ def mired_to_kelvin(mired: int) -> int:
     return max(BLE_MIN_KELVIN, min(BLE_MAX_KELVIN, kelvin))
 
 
+def _minutes_to_hours_minutes(minutes: int) -> float:
+    """Return a UTC offset the way the lamp holds it: 5.30 for +05:30."""
+    hours, rest = divmod(abs(minutes), 60)
+    return (hours + rest / 100) * (-1 if minutes < 0 else 1)
+
+
+def _hours_minutes_to_minutes(value: float) -> int:
+    """Return the minutes in a UTC offset the lamp holds as hours.minutes."""
+    hours = int(abs(value))
+    rest = round((abs(value) - hours) * 100)
+    return (hours * 60 + rest) * (-1 if value < 0 else 1)
+
+
 # ── DysonBLEDevice ────────────────────────────────────────────────────────────
 
 
@@ -480,6 +510,10 @@ class BLELightState:
     auto_brightness: bool | None = None  # char 11006; None = unknown
     movement_mode: bool | None = None  # char 11007; None = unknown
     preset: str | None = None  # "none", "study", "relax", "precision"; None = unknown
+    # The day the lamp tracks, minutes past local midnight.  Zero or None means
+    # it has no location, and so no day: it will refuse daylight mode.
+    day_start_minutes: int | None = None
+    day_end_minutes: int | None = None
     motion_detected: bool = False
     last_motion_at: float = 0.0
     char_11006_hex: str | None = None
@@ -552,6 +586,8 @@ class DysonBLEDevice:
         self._on_mac_resolved = on_mac_resolved
         self._manual_mode_valid_until = 0.0
         self._last_write_at = 0.0
+        self._clock_synced_at = 0.0
+        self._lamp_utc_offset_minutes: int | None = None
 
         self.state = BLELightState()
         self._client: Any | None = None  # BleakClient at runtime
@@ -747,6 +783,19 @@ class DysonBLEDevice:
         if attribute == _ATTR_DAYLIGHT_MODE and value:
             self.state.daylight_mode = value[0] != 0
             self._fire_state_change()
+        elif attribute == _ATTR_UTC_OFFSET and len(value) == 4:  # noqa: PLR2004
+            import struct
+
+            self._lamp_utc_offset_minutes = _hours_minutes_to_minutes(
+                struct.unpack("<f", value)[0]
+            )
+        elif attribute in (_ATTR_DAY_START, _ATTR_DAY_END) and value:
+            minutes = int.from_bytes(value, byteorder="little")
+            if attribute == _ATTR_DAY_START:
+                self.state.day_start_minutes = minutes
+            else:
+                self.state.day_end_minutes = minutes
+            self._fire_state_change()
         elif attribute in _ATTR_PRESETS and value:
             name = _ATTR_PRESETS[attribute]
             if value[0] != 0:
@@ -773,6 +822,89 @@ class DysonBLEDevice:
             bytes([_ATTR_HEADER, msg_type]) + body,
             response=False,
         )
+
+    async def _write_attr(self, attribute_id: int, value: bytes) -> None:
+        """Set an attribute: ``attribute(2) || length(2) || value``, framed."""
+        await self._write_attr_message(
+            _ATTR_TYPE_WRITE,
+            attribute_id.to_bytes(2, byteorder="little")
+            + len(value).to_bytes(2, byteorder="little")
+            + value,
+        )
+
+    async def _sync_clock(self) -> None:
+        """Tell the lamp the time and its offset from UTC.
+
+        The offset is written for standard time and read back.  If what the
+        lamp then holds is not the offset in force now (its daylight-saving
+        rules are not this zone's, or it has none), the difference is written
+        in, so the lamp ends up on the right local time either way.
+        """
+        import struct
+        import time
+
+        from homeassistant.util import dt as dt_util
+
+        await self._write_attr_message(
+            _ATTR_TYPE_SET_CLOCK, int(time.time()).to_bytes(4, byteorder="little")
+        )
+        now = dt_util.now()
+        offset = now.utcoffset()
+        current = int(offset.total_seconds() // 60) if offset is not None else 0
+        dst = now.dst()
+        standard = current - (int(dst.total_seconds() // 60) if dst else 0)
+        offset_attribute = _ATTR_UTC_OFFSET.to_bytes(2, byteorder="little")
+        for wanted in (standard, None):
+            if wanted is None:
+                held = self._lamp_utc_offset_minutes
+                if held is None or held == current:
+                    break
+                wanted = standard + (current - held)
+            self._lamp_utc_offset_minutes = None
+            await asyncio.sleep(0.3)
+            await self._write_attr(
+                _ATTR_UTC_OFFSET, struct.pack("<f", _minutes_to_hours_minutes(wanted))
+            )
+            await asyncio.sleep(0.3)
+            await self._write_attr_message(_ATTR_TYPE_READ, offset_attribute)
+            await asyncio.sleep(0.5)
+        self._clock_synced_at = asyncio.get_running_loop().time()
+
+    async def _sync_clock_and_location(self) -> None:
+        """Give the lamp the time and Home Assistant's home location.
+
+        The clock goes first: without one the lamp discards the coordinates.
+        Afterwards the day the lamp worked out is read back, which is the only
+        sign from outside that it took the location.  The daylight-saving
+        rules (attribute 0x201d) are left as the lamp has them.
+        """
+        import struct
+
+        await self._sync_clock()
+        latitude = self.hass.config.latitude
+        longitude = self.hass.config.longitude
+        if latitude or longitude:
+            # The gaps are the app's own.
+            await asyncio.sleep(0.3)
+            await self._write_attr(_ATTR_LATITUDE, struct.pack("<d", latitude))
+            await asyncio.sleep(0.3)
+            await self._write_attr(_ATTR_LONGITUDE, struct.pack("<d", longitude))
+            await asyncio.sleep(0.5)
+        await self._read_day()
+
+    async def _read_day(self) -> None:
+        """Ask the lamp where it places itself, for its day and for its mode."""
+        for attribute_id in (
+            _ATTR_LATITUDE,
+            _ATTR_LONGITUDE,
+            _ATTR_UTC_OFFSET,
+            _ATTR_DAY_START,
+            _ATTR_DAY_END,
+            _ATTR_DAYLIGHT_MODE,
+        ):
+            await self._write_attr_message(
+                _ATTR_TYPE_READ, attribute_id.to_bytes(2, byteorder="little")
+            )
 
     def _on_bleak_disconnect(self, client: Any) -> None:  # noqa: ARG002
         """Handle unexpected BLE disconnect (called by bleak_retry_connector).
@@ -1338,6 +1470,7 @@ class DysonBLEDevice:
                         _ATTR_TYPE_SUBSCRIBE, attribute + b"\x00"
                     )
                     await self._write_attr_message(_ATTR_TYPE_READ, attribute)
+                await self._sync_clock_and_location()
             except Exception as exc:  # noqa: BLE001
                 _LOGGER.warning(
                     "Could not subscribe to the attribute channel of %s: %s "
@@ -1783,6 +1916,19 @@ class DysonBLEDevice:
         """
         if not self.is_connected:
             return
+        if (
+            self._daylight_capable
+            and asyncio.get_running_loop().time() - self._clock_synced_at
+            > _CLOCK_RESYNC_SECONDS
+        ):
+            try:
+                async with self._lock:
+                    await self._sync_clock()
+                    await self._read_day()
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.debug(
+                    "Could not set the clock of %s: %s", self.serial_number, exc
+                )
         self._fire_state_change()
 
     @property

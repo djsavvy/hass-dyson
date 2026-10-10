@@ -726,6 +726,20 @@ class DysonDaylightModeSwitch(DysonBLEEntity, SwitchEntity):
         self._attr_unique_id = f"{serial}_daylight_mode"
 
     @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return the day the lamp tracks, as it worked it out from its location."""
+        data = self.coordinator.data or {}
+        attributes: dict[str, Any] = {}
+        for key, name in (
+            ("day_start_minutes", "day_start"),
+            ("day_end_minutes", "day_end"),
+        ):
+            minutes = data.get(key)
+            if minutes:
+                attributes[name] = f"{minutes // 60:02d}:{minutes % 60:02d}"
+        return attributes
+
+    @property
     def is_on(self) -> bool | None:
         """Return True when daylight mode is active."""
         data = self.coordinator.data
