@@ -86,6 +86,28 @@ _KEEPALIVE_INTERVAL = 20.0
 # reassert manual mode in case the physical daylight button was pressed.
 _MANUAL_MODE_SESSION_SECONDS = 1.0
 
+# The lamp discards a control write that arrives straight behind another
+# (measured by rummeyer/homebridge-dyson-solarcycle-morph: 1 of 8 landed back
+# to back, 8 of 8 at 100 ms), so control writes are kept this far apart.
+_MIN_WRITE_GAP_SECONDS = 0.15
+
+# Attribute channel (characteristic 0021).  A message is one fragment: the
+# 0x80 header, a type, then the body.  Source: docs/PROTOCOL.md of
+# rummeyer/homebridge-dyson-solarcycle-morph, measured on a CF06.
+_ATTR_HEADER = 0x80
+_ATTR_TYPE_READ = 0x90  # → lamp: attribute(2)
+_ATTR_TYPE_READ_REPLY = 0x91  # ← lamp: attribute(2) status length(2) value
+_ATTR_TYPE_WRITE = 0x93  # → lamp: attribute(2) length(2) value
+_ATTR_TYPE_SUBSCRIBE = 0x96  # → lamp: attribute(2) 00
+_ATTR_TYPE_REPORT = 0x97  # ← lamp: attribute(2) length(2) value
+_ATTR_DAYLIGHT_MODE = 0x2013
+# The app's preset modes.  Writing 01 activates one, and the lamp reports the
+# others going off; writing 00 clears it and the light stays as the preset
+# left it.  ("Synchronised", the app's fourth, is daylight mode.)
+BLE_PRESET_NONE = "none"
+_ATTR_PRESETS = {0x201E: "study", 0x201F: "relax", 0x2021: "precision"}
+BLE_PRESETS = [BLE_PRESET_NONE, *_ATTR_PRESETS.values()]
+
 # Maximum auth handshake attempts before giving up on a connection.
 # Each attempt resends PayloadA (0x06) with a fresh nonce and waits for
 # PayloadB (0x07).  With low-duty-cycle BLE scan windows (e.g. the
@@ -455,6 +477,9 @@ class BLELightState:
     color_temp_kelvin: int | None = None
     color_temp_mired: int | None = None
     daylight_mode: bool | None = None  # None = unknown, True = auto, False = manual
+    auto_brightness: bool | None = None  # char 11006; None = unknown
+    movement_mode: bool | None = None  # char 11007; None = unknown
+    preset: str | None = None  # "none", "study", "relax", "precision"; None = unknown
     motion_detected: bool = False
     last_motion_at: float = 0.0
     char_11006_hex: str | None = None
@@ -526,6 +551,7 @@ class DysonBLEDevice:
         self._daylight_capable = daylight_capable
         self._on_mac_resolved = on_mac_resolved
         self._manual_mode_valid_until = 0.0
+        self._last_write_at = 0.0
 
         self.state = BLELightState()
         self._client: Any | None = None  # BleakClient at runtime
@@ -679,9 +705,74 @@ class DysonBLEDevice:
         def _handler(_characteristic: Any, data: bytearray) -> None:
             hex_value = bytes(data).hex()
             setattr(self.state, f"char_{short_id}_hex", hex_value)
+            self._apply_mode_char(short_id, bytes(data))
             self._fire_state_change()
 
         return _handler
+
+    def _apply_mode_char(self, short_id: str, raw: bytes) -> None:
+        """Decode a mode-switch characteristic: 11006 auto brightness, 11007 movement."""
+        if not raw:
+            return
+        if short_id == "11006":
+            self.state.auto_brightness = raw[0] != 0
+        elif short_id == "11007":
+            self.state.movement_mode = raw[0] != 0
+
+    def _on_attr_notification(self, _characteristic: Any, data: bytearray) -> None:
+        """Handle a message from the attribute channel (characteristic 0021).
+
+        Decodes replies to reads (0x91) and unasked reports (0x97).  The value
+        sits one byte further along in a reply, which carries a status byte.
+        """
+        raw = bytes(data)
+        if len(raw) < 4 or raw[0] != _ATTR_HEADER:  # noqa: PLR2004
+            return
+        attribute = int.from_bytes(raw[2:4], byteorder="little")
+        if raw[1] == _ATTR_TYPE_READ_REPLY:
+            if len(raw) < 8 or raw[4] != 0:  # noqa: PLR2004
+                return
+            value = raw[7:]
+        elif raw[1] == _ATTR_TYPE_REPORT:
+            value = raw[6:]
+        else:
+            return
+        _LOGGER.debug(
+            "Attribute 0x%04X from %s: type=0x%02X value=%s",
+            attribute,
+            self.serial_number,
+            raw[1],
+            value.hex(),
+        )
+        if attribute == _ATTR_DAYLIGHT_MODE and value:
+            self.state.daylight_mode = value[0] != 0
+            self._fire_state_change()
+        elif attribute in _ATTR_PRESETS and value:
+            name = _ATTR_PRESETS[attribute]
+            if value[0] != 0:
+                self.state.preset = name
+            elif self.state.preset in (None, name):
+                self.state.preset = BLE_PRESET_NONE
+            self._fire_state_change()
+
+    async def _pace_write(self) -> None:
+        """Wait until a control write may follow the previous one."""
+        loop = asyncio.get_running_loop()
+        wait = self._last_write_at + _MIN_WRITE_GAP_SECONDS - loop.time()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        self._last_write_at = loop.time()
+
+    async def _write_attr_message(self, msg_type: int, body: bytes) -> None:
+        """Send one framed message on the attribute channel."""
+        if self._client is None:
+            return
+        await self._pace_write()
+        await self._client.write_gatt_char(
+            BLE_WRITE_ATTR_CHAR_UUID,
+            bytes([_ATTR_HEADER, msg_type]) + body,
+            response=False,
+        )
 
     def _on_bleak_disconnect(self, client: Any) -> None:  # noqa: ARG002
         """Handle unexpected BLE disconnect (called by bleak_retry_connector).
@@ -699,6 +790,9 @@ class DysonBLEDevice:
         self.state.connected = False
         self.state.authenticated = False
         self.state.daylight_mode = None
+        self.state.auto_brightness = None
+        self.state.movement_mode = None
+        self.state.preset = None
         self._manual_mode_valid_until = 0.0
         self._client = None
         self._fire_state_change()
@@ -1173,6 +1267,23 @@ class DysonBLEDevice:
                 exc,
             )
 
+        # Mode switches: auto brightness (11006) and movement (11007)
+        for short_id, uuid in (
+            ("11006", BLE_CHAR_11006_UUID),
+            ("11007", BLE_CHAR_11007_UUID),
+        ):
+            try:
+                mode_raw = bytes(await self._client.read_gatt_char(uuid))
+                setattr(self.state, f"char_{short_id}_hex", mode_raw.hex())
+                self._apply_mode_char(short_id, mode_raw)
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.debug(
+                    "Could not read characteristic %s from %s: %s",
+                    short_id,
+                    self.serial_number,
+                    exc,
+                )
+
     async def _subscribe_notifications(self) -> None:
         """Subscribe to notify characteristics for real-time updates."""
         if self._client is None:
@@ -1210,20 +1321,30 @@ class DysonBLEDevice:
                     exc,
                 )
 
-        # Motion notifications (most important — drives binary sensor)
-        try:
-            await self._client.start_notify(
-                BLE_MOTION_UUID, self._on_motion_notification
-            )
-            _LOGGER.debug(
-                "Subscribed to motion notifications for %s", self.serial_number
-            )
-        except Exception as exc:  # noqa: BLE001
-            _LOGGER.warning(
-                "Failed to subscribe to motion characteristic for %s: %s",
-                self.serial_number,
-                exc,
-            )
+        # Characteristic 11008 is not subscribed.  The earlier notes call it
+        # motion, but on a CF06 it holds one value whatever the lamp or the
+        # room is doing (homebridge-dyson-solarcycle-morph, docs/PROTOCOL.md).
+
+        # Attribute channel: daylight mode is reported here once subscribed
+        # to, and asked for outright so the state is known from the start.
+        if self._daylight_capable:
+            try:
+                await self._client.start_notify(
+                    BLE_WRITE_ATTR_CHAR_UUID, self._on_attr_notification
+                )
+                for attribute_id in (_ATTR_DAYLIGHT_MODE, *_ATTR_PRESETS):
+                    attribute = attribute_id.to_bytes(2, byteorder="little")
+                    await self._write_attr_message(
+                        _ATTR_TYPE_SUBSCRIBE, attribute + b"\x00"
+                    )
+                    await self._write_attr_message(_ATTR_TYPE_READ, attribute)
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.warning(
+                    "Could not subscribe to the attribute channel of %s: %s "
+                    "— daylight mode will not be reported",
+                    self.serial_number,
+                    exc,
+                )
 
         # Runtime / diagnostic notifications (best-effort)
         # Note: 11009 is now the primary brightness channel and is subscribed
@@ -1420,6 +1541,7 @@ class DysonBLEDevice:
                 self.serial_number,
                 payload.hex(),
             )
+            await self._pace_write()
             await self._client.write_gatt_char(BLE_POWER_UUID, payload, response=False)
             # Update state optimistically from the written value.
             # GATT reads via a BLE proxy can take several seconds each;
@@ -1428,56 +1550,25 @@ class DysonBLEDevice:
             self._fire_state_change()
 
     async def _disable_daylight_mode(self) -> None:
-        """Write the Daylight-Mode-disable packet to the write-attribute characteristic.
+        """Space a manual brightness or colour-temperature write from the last write.
 
-        The Lightcycle Morph (CF06) runs a daylight algorithm that silently
-        ignores BLE writes to chars 11009 (brightness) and 11001 (colour
-        temperature) when in auto/daylight mode.  Writing this packet to
-        characteristic 0021 (service 0020) switches the lamp to manual mode
-        so that subsequent brightness and colour-temperature writes are applied.
-
-        Packet format (source: q90.C30568o / q90.C30554a):
-          [0x13, 0x20] = DAYLIGHT_MODE attribute ID
-          [0x01, 0x00] = value length = 1 (uint16 LE)
-          [0x00]       = false → disable daylight mode
+        Nothing has to be switched off first: the lamp takes these writes while
+        daylight mode is on, ends the tracking itself and reports that on the
+        attribute channel (homebridge-dyson-solarcycle-morph, docs/PROTOCOL.md,
+        8 of 8 trials).  The packet this method used to send was a report body
+        without its message type, which the lamp ignores.
         """
-        if self._client is None or not self._daylight_capable:
-            return
-        loop = asyncio.get_running_loop()
-        if loop.time() < self._manual_mode_valid_until:
-            return
-        _LOGGER.debug(
-            "Disabling daylight mode on %s (char 0021, payload=%s)",
-            self.serial_number,
-            BLE_DAYLIGHT_MODE_DISABLE_PAYLOAD.hex(),
-        )
-        await self._client.write_gatt_char(
-            BLE_WRITE_ATTR_CHAR_UUID,
-            BLE_DAYLIGHT_MODE_DISABLE_PAYLOAD,
-            # Manual controls depend on this mode change.  Do not race the
-            # following value write against an unacknowledged ATT command.
-            response=True,
-        )
-        self.state.daylight_mode = False
-        # The acknowledgement confirms receipt, but the lamp applies the mode
-        # transition asynchronously.  Allow it to enter manual mode before the
-        # brightness or colour-temperature write arrives.
-        await asyncio.sleep(0.2)
-        self._manual_mode_valid_until = loop.time() + _MANUAL_MODE_SESSION_SECONDS
+        await self._pace_write()
 
     async def set_daylight_mode(self, enabled: bool) -> None:
-        """Enable or disable the lamp’s daylight (auto) mode.
+        """Enable or disable the lamp's daylight tracking.
 
-        When daylight mode is **enabled** the lamp controls its own brightness
-        and colour temperature automatically based on the time of day, ambient
-        light, and user age profile.  Writes to characteristic 11009/11001 are
-        silently ignored in this mode.
+        While it is on the lamp moves its colour temperature through the day.
+        A manual brightness or colour-temperature change ends it.
 
-        When daylight mode is **disabled** (manual mode) the lamp accepts
-        explicit brightness and colour-temperature writes from Home Assistant.
-
-        Writes to service 0020, characteristic 0021 using the Dyson
-        write-attribute protocol (source: q90.C30568o, q90.C30554a).
+        Written as attribute 0x2013 on characteristic 0021 and then read back,
+        because the lamp can accept the write and still not act on it (it
+        refuses daylight tracking until its location and clock are set).
 
         Args:
             enabled: ``True`` to enable daylight mode, ``False`` to disable.
@@ -1488,31 +1579,83 @@ class DysonBLEDevice:
         if not self.is_connected or self._client is None:
             raise RuntimeError(f"{self.serial_number} is not connected")
         async with self._lock:
-            payload = (
-                BLE_DAYLIGHT_MODE_ENABLE_PAYLOAD
-                if enabled
-                else BLE_DAYLIGHT_MODE_DISABLE_PAYLOAD
-            )
+            attribute = _ATTR_DAYLIGHT_MODE.to_bytes(2, byteorder="little")
             _LOGGER.debug(
-                "Setting daylight mode %s on %s (char 0021, payload=%s)",
+                "Setting daylight mode %s on %s (attribute 0x2013)",
                 "ON" if enabled else "OFF",
                 self.serial_number,
-                payload.hex(),
             )
-            await self._client.write_gatt_char(
-                BLE_WRITE_ATTR_CHAR_UUID,
-                payload,
-                response=True,
+            await self._write_attr_message(
+                _ATTR_TYPE_WRITE, attribute + b"\x01\x00" + bytes([int(enabled)])
             )
             self.state.daylight_mode = enabled
-            if enabled:
-                self._manual_mode_valid_until = 0.0
-            else:
-                await asyncio.sleep(0.2)
-                self._manual_mode_valid_until = (
-                    asyncio.get_running_loop().time() + _MANUAL_MODE_SESSION_SECONDS
-                )
             self._fire_state_change()
+            await asyncio.sleep(0.3)
+            await self._write_attr_message(_ATTR_TYPE_READ, attribute)
+
+    async def _set_mode_char(self, short_id: str, uuid: str, enabled: bool) -> None:
+        """Write a one-byte mode switch (11006 auto brightness, 11007 movement)."""
+        if not self.is_connected or self._client is None:
+            raise RuntimeError(f"{self.serial_number} is not connected")
+        async with self._lock:
+            await self._pace_write()
+            await self._client.write_gatt_char(
+                uuid, bytes([int(enabled)]), response=False
+            )
+            self._apply_mode_char(short_id, bytes([int(enabled)]))
+            self._fire_state_change()
+
+    async def set_preset(self, preset: str) -> None:
+        """Activate one of the lamp's preset modes, or clear the active one.
+
+        Args:
+            preset: One of :data:`BLE_PRESETS`.
+
+        Raises:
+            RuntimeError: If the lamp is not connected and authenticated.
+            ValueError: If ``preset`` is not a known preset.
+        """
+        if preset not in BLE_PRESETS:
+            raise ValueError(f"Unknown preset {preset!r}")
+        if not self.is_connected or self._client is None:
+            raise RuntimeError(f"{self.serial_number} is not connected")
+        async with self._lock:
+            if preset == BLE_PRESET_NONE:
+                # Clear the one that is on, or all three if that is not known.
+                writes = [
+                    (attribute_id, False)
+                    for attribute_id, name in _ATTR_PRESETS.items()
+                    if self.state.preset in (None, name)
+                ]
+            else:
+                writes = [
+                    (attribute_id, True)
+                    for attribute_id, name in _ATTR_PRESETS.items()
+                    if name == preset
+                ]
+            for attribute_id, enabled in writes:
+                await self._write_attr_message(
+                    _ATTR_TYPE_WRITE,
+                    attribute_id.to_bytes(2, byteorder="little")
+                    + b"\x01\x00"
+                    + bytes([int(enabled)]),
+                )
+            self.state.preset = preset
+            self._fire_state_change()
+            # Ask rather than trust the write: the reply corrects the state.
+            await asyncio.sleep(0.3)
+            for attribute_id in _ATTR_PRESETS:
+                await self._write_attr_message(
+                    _ATTR_TYPE_READ, attribute_id.to_bytes(2, byteorder="little")
+                )
+
+    async def set_auto_brightness(self, enabled: bool) -> None:
+        """Switch auto brightness: the lamp trims its output to the room's light."""
+        await self._set_mode_char("11006", BLE_CHAR_11006_UUID, enabled)
+
+    async def set_movement_mode(self, enabled: bool) -> None:
+        """Switch movement mode: the lamp lights on movement and goes out once still."""
+        await self._set_mode_char("11007", BLE_CHAR_11007_UUID, enabled)
 
     async def set_brightness(self, ha_brightness: int) -> None:
         """Set brightness.

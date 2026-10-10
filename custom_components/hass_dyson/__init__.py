@@ -493,7 +493,7 @@ async def _setup_ble_device_entry(hass: HomeAssistant, entry: ConfigEntry) -> bo
     )
     ble_platforms = ["light", "binary_sensor"]
     if has_daylight:
-        ble_platforms.append("switch")
+        ble_platforms.extend(["switch", "select"])
 
     await hass.config_entries.async_forward_entry_setups(entry, ble_platforms)
     _LOGGER.info(
@@ -912,7 +912,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
         ble_platforms = ["light", "binary_sensor"]
         if has_daylight:
-            ble_platforms.append("switch")
+            ble_platforms.extend(["switch", "select"])
         unload_ok = await hass.config_entries.async_unload_platforms(
             entry, ble_platforms
         )

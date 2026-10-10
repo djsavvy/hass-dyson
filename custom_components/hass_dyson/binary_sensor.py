@@ -139,7 +139,9 @@ async def async_setup_entry(
     # BLE light devices — motion sensor only
     if isinstance(entry_data, dict) and entry_data.get("is_ble"):
         ble_coordinator: DysonBLEDataUpdateCoordinator = entry_data["ble_coordinator"]
-        async_add_entities([DysonMotionBinarySensor(ble_coordinator)], True)
+        # No motion sensor: characteristic 11008 does not report motion on a
+        # CF06 (see ble_device.py), so the sensor only ever read "clear".
+        _ = ble_coordinator
         return True
 
     # MQTT-based devices — existing fault / filter sensors

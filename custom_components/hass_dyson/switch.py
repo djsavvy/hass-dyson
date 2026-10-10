@@ -37,7 +37,24 @@ async def async_setup_entry(
     # BLE-only light devices (Lightcycle Morph CF06/CD06)
     if isinstance(entry_data, dict) and entry_data.get("is_ble"):
         ble_coordinator: DysonBLEDataUpdateCoordinator = entry_data["ble_coordinator"]
-        async_add_entities([DysonDaylightModeSwitch(ble_coordinator)], True)
+        async_add_entities(
+            [
+                DysonDaylightModeSwitch(ble_coordinator),
+                DysonBLEModeSwitch(
+                    ble_coordinator,
+                    "auto_brightness",
+                    "Auto brightness",
+                    "mdi:brightness-auto",
+                ),
+                DysonBLEModeSwitch(
+                    ble_coordinator,
+                    "movement_mode",
+                    "Movement mode",
+                    "mdi:motion-sensor",
+                ),
+            ],
+            True,
+        )
         return True
 
     # MQTT / cloud-connected devices
@@ -752,3 +769,62 @@ class DysonDaylightModeSwitch(DysonBLEEntity, SwitchEntity):
                 self.coordinator.serial_number,
                 err,
             )
+
+
+class DysonBLEModeSwitch(DysonBLEEntity, SwitchEntity):
+    """One of the lamp's own mode switches: auto brightness or movement mode.
+
+    Auto brightness trims the lamp's output to hold the room at a steady
+    level.  Movement mode lights the lamp on movement and puts it out once
+    the room is still.  Both are one-byte characteristics the lamp reports
+    changes of, so the switch follows the buttons on the lamp too.
+    """
+
+    coordinator: DysonBLEDataUpdateCoordinator
+
+    def __init__(
+        self,
+        coordinator: DysonBLEDataUpdateCoordinator,
+        key: str,
+        name: str,
+        icon: str,
+    ) -> None:
+        """Initialise the switch for the state field and setter named ``key``."""
+        super().__init__(coordinator)
+        self._key = key
+        self._attr_name = name
+        self._attr_icon = icon
+        self._attr_unique_id = f"{coordinator.serial_number}_{key}"
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return the mode's state, or None while it has not been read."""
+        data = self.coordinator.data
+        if data is None or data.get(self._key) is None:
+            return None
+        return bool(data[self._key])
+
+    async def _async_set(self, enabled: bool) -> None:
+        dev = self.coordinator.ble_device
+        if dev is None:
+            _LOGGER.warning(
+                "No BLE device available for %s", self.coordinator.serial_number
+            )
+            return
+        try:
+            await getattr(dev, f"set_{self._key}")(enabled)
+        except RuntimeError as err:
+            _LOGGER.error(
+                "Failed to set %s for %s: %s",
+                self._key,
+                self.coordinator.serial_number,
+                err,
+            )
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        """Switch the mode on."""
+        await self._async_set(True)
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        """Switch the mode off."""
+        await self._async_set(False)

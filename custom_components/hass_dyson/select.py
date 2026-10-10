@@ -17,8 +17,8 @@ from .const import (
     ROBOT_POWER_OPTIONS_HEURIST,
     ROBOT_POWER_OPTIONS_VIS_NAV,
 )
-from .coordinator import DysonDataUpdateCoordinator
-from .entity import DysonEntity
+from .coordinator import DysonBLEDataUpdateCoordinator, DysonDataUpdateCoordinator
+from .entity import DysonBLEEntity, DysonEntity
 from .spot_scrub_select import DysonSpotScrubCleaningModeSelect
 
 _LOGGER = logging.getLogger(__name__)
@@ -38,7 +38,14 @@ async def async_setup_entry(
     ):
         return None
 
-    coordinator: DysonDataUpdateCoordinator = hass.data[DOMAIN][config_entry.entry_id]
+    entry_data = hass.data[DOMAIN][config_entry.entry_id]
+
+    # BLE-only light devices (Lightcycle Morph CF06/CD06): the preset modes
+    if isinstance(entry_data, dict) and entry_data.get("is_ble"):
+        async_add_entities([DysonBLEPresetSelect(entry_data["ble_coordinator"])], True)
+        return None
+
+    coordinator: DysonDataUpdateCoordinator = entry_data
 
     entities: list[SelectEntity] = []
 
@@ -1419,3 +1426,48 @@ class DysonTiltOscillationModeSelect(DysonEntity, SelectEntity):
         attributes["tilt_angle_control"] = anct
 
         return attributes
+
+
+class DysonBLEPresetSelect(DysonBLEEntity, SelectEntity):
+    """The lamp's preset modes: Study, Relax and Precision, or none of them.
+
+    Each sets the lamp to its own brightness and colour temperature.  The
+    lamp reports which is active, so the select follows the MyDyson app too.
+    Clearing a preset leaves the light as the preset set it.
+    """
+
+    coordinator: DysonBLEDataUpdateCoordinator
+
+    _attr_name = "Preset"
+    _attr_icon = "mdi:lightbulb-group"
+
+    def __init__(self, coordinator: DysonBLEDataUpdateCoordinator) -> None:
+        """Initialise the preset select."""
+        from .ble_device import BLE_PRESETS
+
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{coordinator.serial_number}_preset"
+        self._attr_options = [preset.capitalize() for preset in BLE_PRESETS]
+
+    @property
+    def current_option(self) -> str | None:
+        """Return the active preset, or None while it has not been read."""
+        data = self.coordinator.data
+        if data is None or data.get("preset") is None:
+            return None
+        return str(data["preset"]).capitalize()
+
+    async def async_select_option(self, option: str) -> None:
+        """Activate the chosen preset."""
+        dev = self.coordinator.ble_device
+        if dev is None:
+            _LOGGER.warning(
+                "No BLE device available for %s", self.coordinator.serial_number
+            )
+            return
+        try:
+            await dev.set_preset(option.lower())
+        except RuntimeError as err:
+            _LOGGER.error(
+                "Failed to set preset for %s: %s", self.coordinator.serial_number, err
+            )
