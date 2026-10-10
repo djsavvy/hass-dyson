@@ -91,6 +91,11 @@ _MANUAL_MODE_SESSION_SECONDS = 1.0
 # to back, 8 of 8 at 100 ms), so control writes are kept this far apart.
 _MIN_WRITE_GAP_SECONDS = 0.15
 
+# A power write is confirmed by the lamp's own report of the change, which
+# comes about 0.2 s after a write that landed (through an ESPHome proxy).
+_POWER_WRITE_ATTEMPTS = 3
+_POWER_REPORT_TIMEOUT_SECONDS = 1.5
+
 # Attribute channel (characteristic 0021).  A message is one fragment: the
 # 0x80 header, a type, then the body.  Source: docs/PROTOCOL.md of
 # rummeyer/homebridge-dyson-solarcycle-morph, measured on a CF06.
@@ -588,6 +593,7 @@ class DysonBLEDevice:
         self._last_write_at = 0.0
         self._clock_synced_at = 0.0
         self._lamp_utc_offset_minutes: int | None = None
+        self._power_reported = asyncio.Event()
 
         self.state = BLELightState()
         self._client: Any | None = None  # BleakClient at runtime
@@ -656,6 +662,7 @@ class DysonBLEDevice:
             "ON" if power_on else "OFF",
         )
         self.state.power = power_on
+        self._power_reported.set()
         self._fire_state_change()
 
     def _on_brightness_notification(
@@ -1674,13 +1681,52 @@ class DysonBLEDevice:
                 self.serial_number,
                 payload.hex(),
             )
-            await self._pace_write()
-            await self._client.write_gatt_char(BLE_POWER_UUID, payload, response=False)
-            # Update state optimistically from the written value.
-            # GATT reads via a BLE proxy can take several seconds each;
-            # BLE notifications will keep state current.
-            self.state.power = on
+            if self.state.power == on:
+                # Nothing will change, so the lamp will not report anything.
+                await self._pace_write()
+                await self._client.write_gatt_char(
+                    BLE_POWER_UUID, payload, response=False
+                )
+                return
+            # The write is unacknowledged and the lamp drops the odd one, but
+            # it reports a power change within a fraction of a second.  Wait
+            # for that report and write again if it does not come.
+            for attempt in range(1, _POWER_WRITE_ATTEMPTS + 1):
+                self._power_reported.clear()
+                await self._pace_write()
+                await self._client.write_gatt_char(
+                    BLE_POWER_UUID, payload, response=False
+                )
+                try:
+                    await asyncio.wait_for(
+                        self._power_reported.wait(), _POWER_REPORT_TIMEOUT_SECONDS
+                    )
+                except TimeoutError:
+                    pass
+                if self.state.power == on:
+                    return
+                _LOGGER.debug(
+                    "%s did not report power %s after write %d",
+                    self.serial_number,
+                    "ON" if on else "OFF",
+                    attempt,
+                )
+            # Ask outright, so the entity shows what the lamp is doing.
+            try:
+                power_raw = bytes(await self._client.read_gatt_char(BLE_POWER_UUID))
+                self.state.power = bool(power_raw and power_raw[0] != 0)
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.debug(
+                    "Could not read power state from %s: %s", self.serial_number, exc
+                )
             self._fire_state_change()
+            if self.state.power != on:
+                _LOGGER.warning(
+                    "%s did not switch %s after %d attempts",
+                    self.serial_number,
+                    "on" if on else "off",
+                    _POWER_WRITE_ATTEMPTS,
+                )
 
     async def _disable_daylight_mode(self) -> None:
         """Space a manual brightness or colour-temperature write from the last write.
